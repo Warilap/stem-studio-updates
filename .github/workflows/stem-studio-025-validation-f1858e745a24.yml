@@ -1,0 +1,99 @@
+name: STEM STUDIO 0.2.5 validation f1858e745a24
+run-name: STEM STUDIO 0.2.5 validation f1858e745a24
+on:
+  workflow_dispatch:
+    inputs:
+      review_id:
+        required: true
+        type: string
+      release_id:
+        required: true
+        type: string
+      kit_name:
+        required: true
+        type: string
+      kit_sha256:
+        required: true
+        type: string
+      installer_sha256:
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  isolated-windows:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      INPUT_REVIEW: ${{ inputs.review_id }}
+      INPUT_RELEASE: ${{ inputs.release_id }}
+      INPUT_KIT: ${{ inputs.kit_name }}
+      INPUT_KIT_SHA: ${{ inputs.kit_sha256 }}
+      INPUT_INSTALLER_SHA: ${{ inputs.installer_sha256 }}
+    steps:
+      - name: Guard ephemeral VM and prepare disk
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows' -or $env:GITHUB_REPOSITORY -ne 'Warilap/stem-studio-updates') { throw 'Dedicated hosted Windows VM required' }
+          if ($env:INPUT_REVIEW -ne 'f1858e745a24' -or $env:INPUT_KIT -ne 'stem-validation-kit-f1858e745a24.zip' -or $env:INPUT_INSTALLER_SHA -ne '0efcc523545068ac753969a897dd4327ed052bf8b93c0e399ba56dcc7e5717c1' -or $env:INPUT_KIT_SHA -notmatch '^[a-f0-9]{64}$' -or $env:INPUT_RELEASE -notmatch '^\d+$') { throw 'Unexpected review input' }
+          $caseRoot=Join-Path $env:SystemDrive 'StemUpdateE2E-f1858e745a24'
+          if (Test-Path -LiteralPath $caseRoot) { throw 'Test root already exists' }
+          New-Item -ItemType Directory -Path $caseRoot | Out-Null
+          "STEM_VM_ROOT=$caseRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # Only these preinstalled SDK directories, on this disposable hosted VM.
+          foreach ($sdk in @('C:\Android\android-sdk','C:\hostedtoolcache\windows\CodeQL')) {
+            if ((Get-PSDrive C).Free -ge 24GB) { break }
+            if (Test-Path -LiteralPath $sdk) {
+              $resolved=Get-Item -LiteralPath $sdk -Force
+              if ($resolved.FullName -ne $sdk -or ($resolved.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Unexpected SDK path' }
+              Remove-Item -LiteralPath $resolved.FullName -Recurse -Force
+            }
+          }
+          if ((Get-PSDrive C).Free -lt 24GB) { throw 'Insufficient free disk for verified update and rollback' }
+          [pscustomobject]@{root=$caseRoot;freeBytes=(Get-PSDrive C).Free;ephemeral=$true;hostUserDataMapped=$false} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $caseRoot 'ci-environment.json')
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.11'
+      - name: Install test-only dependencies
+        run: python -m pip install --disable-pip-version-check cryptography==50.0.2 packaging==26.3 pyinstaller==6.16.0 certifi==2026.10.23
+      - name: Fetch and authenticate private validation kit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $release=gh api "repos/Warilap/stem-studio-updates/releases/$env:INPUT_RELEASE" | ConvertFrom-Json
+          if (!$release.draft -or $release.tag_name -ne 'v0.2.5' -or $release.body -notlike '*stem-review:f1858e745a24*') { throw 'Not the private review draft' }
+          $download=Join-Path $env:STEM_VM_ROOT 'kit-download'
+          New-Item -ItemType Directory -Path $download | Out-Null
+          gh release download v0.2.5 --repo Warilap/stem-studio-updates --pattern $env:INPUT_KIT --dir $download
+          if ($LASTEXITCODE -ne 0) { throw 'Kit download failed' }
+          $archive=Join-Path $download $env:INPUT_KIT
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:INPUT_KIT_SHA) { throw 'Kit SHA-256 mismatch' }
+          $kit=Join-Path $env:STEM_VM_ROOT 'kit'
+          New-Item -ItemType Directory -Path $kit | Out-Null
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip=[IO.Compression.ZipFile]::OpenRead($archive)
+          try {
+            foreach ($entry in $zip.Entries) {
+              $destination=[IO.Path]::GetFullPath((Join-Path $kit $entry.FullName))
+              if (!$destination.StartsWith($kit+'\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe ZIP path' }
+              if (($entry.ExternalAttributes -shr 16 -band 0xF000) -eq 0xA000) { throw 'ZIP links not allowed' }
+            }
+          } finally { $zip.Dispose() }
+          [IO.Compression.ZipFile]::ExtractToDirectory($archive,$kit)
+          "STEM_TEST_KIT=$kit" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Real installers and unchanged 0.2.4 transaction engine
+        shell: pwsh
+        run: |
+          python (Join-Path $env:STEM_TEST_KIT 'ci_validate_update.py')
+          if ($LASTEXITCODE -ne 0) { throw 'Update validation failed' }
+          Copy-Item -LiteralPath (Join-Path $env:STEM_VM_ROOT 'ci-environment.json') -Destination (Join-Path $env:STEM_VM_ROOT 'reports/ci-environment.json')
+      - name: Preserve actual validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: stem-update-validation-f1858e745a24
+          path: ${{ env.STEM_VM_ROOT }}/reports/
+          if-no-files-found: warn
+          retention-days: 14
