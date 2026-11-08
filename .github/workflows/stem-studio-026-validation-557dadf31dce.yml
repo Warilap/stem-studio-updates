@@ -105,6 +105,45 @@ jobs:
         run: |
           & (Join-Path $env:STEM_TEST_KIT 'create-test-volumes.ps1')
           if ($LASTEXITCODE -ne 0) { throw 'Virtual volume preparation failed' }
+      - name: Add diagnostic collection without changing application or assertions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $captureScript=@'
+          import hashlib,json,os
+          from pathlib import Path
+          root=Path(os.environ['STEM_VM_ROOT']);kit=Path(os.environ['STEM_TEST_KIT'])
+          path=kit/'ci_cross_volume.py';original=path.read_text(encoding='utf-8')
+          needle='    finally:save()'
+          assert original.count(needle)==1
+          capture='''    finally:
+                  diagnostic=reports/'native-diagnostic-data';diagnostic.mkdir(exist_ok=True)
+                  for file in data.rglob('*'):
+                      if not file.is_file() or file.is_symlink():continue
+                      if file.suffix not in ('.json','.log','.txt') and file.name!='.stem-studio-validation':continue
+                      if file.stat().st_size>2**20:continue
+                      target=diagnostic/file.relative_to(data);target.parent.mkdir(parents=True,exist_ok=True)
+                      try:shutil.copyfile(file,target)
+                      except OSError as diagnostic_error:(diagnostic/'capture-error.txt').write_text(type(diagnostic_error).__name__)
+                  report['diagnostic_data_collected']=True
+                  save()'''
+          # YAML indentation has been removed; the captured finally body has eight spaces.
+          changed=original.replace(needle,capture)
+          check_line="def check(name,**detail):report['checks'][name]=True;report['stages'].append(dict(name=name,time=time.time(),**detail));save()"
+          assert changed.count(check_line)==1
+          changed=changed.replace(check_line,check_line+";print('CHECK '+name,flush=True)")
+          changed=changed.replace('        for number in (1,2):','        for number in (1,2):\n            print("NATIVE_RESTART",number,flush=True)')
+          compile(changed,str(path),'exec')
+          (root/'reports/ci-cross-original.py').write_text(original,encoding='utf-8')
+          path.write_text(changed,encoding='utf-8')
+          (root/'reports/ci-cross-instrumented.py').write_text(changed,encoding='utf-8')
+          (root/'reports/harness-diagnostics.json').write_text(json.dumps(dict(application_modified=False,assertions_removed=False,
+              original_sha256=hashlib.sha256(original.encode()).hexdigest(),instrumented_sha256=hashlib.sha256(changed.encode()).hexdigest())),encoding='utf-8')
+          '@
+          $capturePath=Join-Path $env:STEM_VM_ROOT 'instrument-diagnostics.py'
+          Set-Content -LiteralPath $capturePath -Value $captureScript -Encoding utf8
+          python $capturePath
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic harness preparation failed' }
       - name: Low staging, manual migration, native restart and cross-volume rollback
         shell: pwsh
         run: |
